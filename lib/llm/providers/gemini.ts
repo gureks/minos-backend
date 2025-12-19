@@ -15,50 +15,60 @@ export class GeminiProvider implements LLMProvider {
         model: LLM_CONFIG.model,
       });
 
-      // If we have an image URL, fetch it and include in the request
-      if (context?.imageUrl) {
-        console.log('[Gemini] Using vision analysis with image');
+      // If we have an image (either pre-processed base64 or URL)
+      if (context?.imageBase64 || context?.imageUrl) {
+        console.log('[Gemini] Using vision analysis');
         
-        // Fetch the image
-        const imageResponse = await fetch(context.imageUrl);
-        const imageBuffer = await imageResponse.arrayBuffer();
-        const base64Image = Buffer.from(imageBuffer).toString('base64');
+        let base64Image = context.imageBase64;
 
-        const result = await model.generateContent({
-          contents: [{
-            role: 'user',
-            parts: [
-              { text: prompt },
-              {
-                inlineData: {
-                  mimeType: 'image/png',
-                  data: base64Image,
+        // Fallback: If no base64 but URL exists (legacy path), fetch it
+        if (!base64Image && context.imageUrl) {
+           console.log('[Gemini] Fetching image from URL (fallback)...');
+           const imageResponse = await fetch(context.imageUrl);
+           const imageBuffer = await imageResponse.arrayBuffer();
+           base64Image = Buffer.from(imageBuffer).toString('base64');
+        }
+
+        if (base64Image) {
+          const result = await model.generateContent({
+            contents: [{
+              role: 'user',
+              parts: [
+                { text: prompt },
+                {
+                  inlineData: {
+                    mimeType: 'image/png',
+                    data: base64Image,
+                  },
                 },
-              },
-            ],
-          }],
-          generationConfig: {
-            temperature: LLM_CONFIG.temperature,
-            maxOutputTokens: LLM_CONFIG.maxTokens,
-          },
-        });
+              ],
+            }],
+            generationConfig: {
+              temperature: LLM_CONFIG.temperature,
+              maxOutputTokens: LLM_CONFIG.maxTokens,
+            },
+          });
+  
+          const response = result.response;
+          console.log('[Gemini] base64Image Response', response.text());
+          console.log('[Gemini] Image', base64Image);
+          return response.text();
+        }
+      } 
+      
+      // Text-only analysis (else case or if image fetching failed)
+      console.log('[Gemini] Using text-only analysis');
+      const result = await model.generateContent({
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        generationConfig: {
+          temperature: LLM_CONFIG.temperature,
+          maxOutputTokens: LLM_CONFIG.maxTokens,
+        },
+      });
 
-        const response = result.response;
-        return response.text();
-      } else {
-        // Text-only analysis
-        console.log('[Gemini] Using text-only analysis');
-        const result = await model.generateContent({
-          contents: [{ role: 'user', parts: [{ text: prompt }] }],
-          generationConfig: {
-            temperature: LLM_CONFIG.temperature,
-            maxOutputTokens: LLM_CONFIG.maxTokens,
-          },
-        });
-
-        const response = result.response;
-        return response.text();
-      }
+      const response = result.response;
+      return response.text();
+      
     } catch (error: any) {
       console.error('[Gemini] Generation error:', error);
       throw new Error(`Gemini API error: ${error.message}`);

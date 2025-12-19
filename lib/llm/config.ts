@@ -11,6 +11,7 @@ export interface DesignContext {
   nodeType?: string;
   nodeProperties?: any;
   imageUrl?: string;
+  imageBase64?: string; // Optimized cropped image
   commentText: string;
   fileKey: string;
 }
