@@ -22,9 +22,10 @@ export async function getNodeInfo(fileKey: string, nodeId: string, accessToken: 
 }
 
 // Get image render of a node
-export async function getNodeImage(fileKey: string, nodeId: string, accessToken: string) {
+// Get image render of a node
+export async function getNodeImage(fileKey: string, nodeId: string, accessToken: string, scale: number = IMAGE_SCALE) {
   const res = await fetch(
-    `${FIGMA_API_URL}/images/${fileKey}?ids=${nodeId}&format=png&scale=${IMAGE_SCALE}`,
+    `${FIGMA_API_URL}/images/${fileKey}?ids=${nodeId}&format=png&scale=${scale}`,
     {
       headers: { Authorization: `Bearer ${accessToken}` },
     }
@@ -32,12 +33,20 @@ export async function getNodeImage(fileKey: string, nodeId: string, accessToken:
 
   if (!res.ok) {
     const txt = await res.text();
-    console.error('Figma Image Error:', res.status, txt);
+    console.error(`Figma Image Error (Scale ${scale}):`, res.status, txt);
     throw new Error(`Failed to fetch image: ${txt}`);
   }
 
   const data = await res.json();
   return data.images?.[nodeId] || null;
+}
+
+// Helper to determine safe scale based on dimensions
+function getSafeScale(width: number, height: number): number {
+  const maxDim = Math.max(width, height);
+  if (maxDim > 4000) return 0.5; // Very large node -> 0.5x
+  if (maxDim > 2000) return 1;   // Large node -> 1x
+  return 2;                      // Normal node -> 2x
 }
 
 // Extract design context from comment
@@ -71,10 +80,13 @@ export async function extractDesignContext(
       return { nodeId };
     }
 
-    // Extract relevant properties (keeping for reference)
+    // Extract relevant properties
+    const width = node.absoluteBoundingBox?.width || 0;
+    const height = node.absoluteBoundingBox?.height || 0;
+
     const nodeProperties = {
-      width: node.absoluteBoundingBox?.width,
-      height: node.absoluteBoundingBox?.height,
+      width,
+      height,
       x: node.absoluteBoundingBox?.x,
       y: node.absoluteBoundingBox?.y,
     };
@@ -84,8 +96,26 @@ export async function extractDesignContext(
     let imageUrl;
     
     try {
-      console.log('[Design Parser] Fetching node image...');
-      imageUrl = await getNodeImage(fileKey, nodeId, accessToken);
+      // Determine initial safe scale
+      let currentScale = getSafeScale(width, height);
+      console.log(`[Design Parser] Suggesting scale ${currentScale} for node ${width}x${height}`);
+
+      // Attempt verification - usually Scale 2 is fine unless huge
+      // But if it's the Page node (0:1) or HUGE, be conservative
+      if (node.type === 'CANVAS' || node.type === 'DOCUMENT') {
+         currentScale = Math.min(currentScale, 0.5); // Always use low res for full canvas
+      }
+
+      console.log(`[Design Parser] Fetching node image at scale ${currentScale}...`);
+      
+      try {
+        imageUrl = await getNodeImage(fileKey, nodeId, accessToken, currentScale);
+      } catch (e) {
+        console.warn('[Design Parser] Initial fetch failed, retrying with lower scale 0.5...');
+        // Retry logic: If failed (timeout), try lowest scale
+        imageUrl = await getNodeImage(fileKey, nodeId, accessToken, 0.5);
+        currentScale = 0.5;
+      }
       
       if (imageUrl) {
         // Download image to buffer
@@ -99,7 +129,8 @@ export async function extractDesignContext(
         
         if (metadata.width && metadata.height && meta.node_offset) {
           // Calculate coordinates in SCALED image space
-          const scale = IMAGE_SCALE;
+          // IMPORTANT: Use the actual scale we fetched at!
+          const scale = currentScale; 
           const pinX = meta.node_offset.x * scale;
           const pinY = meta.node_offset.y * scale;
           
@@ -119,6 +150,7 @@ export async function extractDesignContext(
             let regionTop = pinY;
             
             // Adjust based on pin corner to find top-left of region
+            // Adjust based on pin corner to find top-left of region
             if (pinCorner === 'bottom-right') {
               regionLeft = pinX - rWidth;
               regionTop = pinY - rHeight;
@@ -133,52 +165,94 @@ export async function extractDesignContext(
               regionTop = pinY;
             }
 
-            // Add Context Margin
-            cropX = regionLeft - CONTEXT_MARGIN;
-            cropY = regionTop - CONTEXT_MARGIN;
-            cropWidth = rWidth + (CONTEXT_MARGIN * 2);
-            cropHeight = rHeight + (CONTEXT_MARGIN * 2);
+            // Optimize Margin Logic
+            // If region is large enough, just use it. If small, expand to MIN_VIEWPORT_SIZE
+            if (rWidth >= MIN_VIEWPORT_SIZE || rHeight >= MIN_VIEWPORT_SIZE) {
+               // Use Exact Region (rounded to int)
+               cropX = Math.round(regionLeft);
+               cropY = Math.round(regionTop);
+               cropWidth = Math.round(rWidth);
+               cropHeight = Math.round(rHeight);
+            } else {
+               // Too small? Add padding to reach MIN_VIEWPORT_SIZE (centered)
+               const centerX = regionLeft + (rWidth / 2);
+               const centerY = regionTop + (rHeight / 2);
+               
+               const viewSize = MIN_VIEWPORT_SIZE;
+               cropX = Math.round(centerX - (viewSize / 2));
+               cropY = Math.round(centerY - (viewSize / 2));
+               cropWidth = viewSize;
+               cropHeight = viewSize;
+            }
             
           } else {
             // It's a Pin comment (point of interest)
             // Center a view window around the pin
             const viewSize = MIN_VIEWPORT_SIZE;
-            cropX = pinX - (viewSize / 2);
-            cropY = pinY - (viewSize / 2);
+            cropX = Math.round(pinX - (viewSize / 2));
+            cropY = Math.round(pinY - (viewSize / 2));
             cropWidth = viewSize;
             cropHeight = viewSize;
           }
 
-          // Ensure bounds are valid (clamp to image size)
-          cropX = Math.max(0, Math.floor(cropX));
-          cropY = Math.max(0, Math.floor(cropY));
+          // Ensure bounds are strictly integers
+          cropX = Math.round(Math.max(0, cropX));
+          cropY = Math.round(Math.max(0, cropY));
           
           // Clamp width/height so we don't go outside image
-          cropWidth = Math.min(cropWidth, metadata.width - cropX);
-          cropHeight = Math.min(cropHeight, metadata.height - cropY);
+          cropWidth = Math.round(Math.min(cropWidth, metadata.width - cropX));
+          cropHeight = Math.round(Math.min(cropHeight, metadata.height - cropY));
 
           // Perform Crop if valid dimensions
           if (cropWidth > 0 && cropHeight > 0) {
             console.log(`[Design Parser] Cropping image to: x=${cropX}, y=${cropY}, w=${cropWidth}, h=${cropHeight}`);
             
-            const croppedBuffer = await originalImage
-              .extract({ left: cropX, top: cropY, width: cropWidth, height: cropHeight })
-              .toBuffer();
-              
-            imageBase64 = croppedBuffer.toString('base64');
+            try {
+              const croppedBuffer = await originalImage
+                .extract({ left: cropX, top: cropY, width: cropWidth, height: cropHeight })
+                .resize({ 
+                  width: 1024, 
+                  height: 1024, 
+                  fit: 'inside', // Keep aspect ratio
+                  withoutEnlargement: true 
+                })
+                .toFormat('jpeg', { quality: 80 })
+                .toBuffer();
+                
+              imageBase64 = croppedBuffer.toString('base64');
+            } catch (cropError) {
+              console.error('[Design Parser] Crop failed, falling back to full image:', cropError);
+              throw cropError; // Re-throw to trigger fallback below
+            }
           } else {
-            // Fallback to full image if calculations fail
-            console.log('[Design Parser] Crop calculation invalid, using full image');
-            imageBase64 = imgBuffer.toString('base64');
+             throw new Error('Invalid crop dimensions');
           }
         } else {
-            // Fallback: No metadata or offset, use full image
-            console.log('[Design Parser] Missing metadata/offset, using full image');
-            imageBase64 = imgBuffer.toString('base64');
+            throw new Error('Missing metadata or offset');
         }
       }
     } catch (imgError) {
-      console.error('[Design Parser] Failed to process image:', imgError);
+      console.error('[Design Parser] Smart processing failed, falling back to full image optimization:', imgError);
+      
+      // Fallback: Resize and optimize the original full buffer if possible
+      if (imageUrl) {
+         try {
+           const imgRes = await fetch(imageUrl);
+           const imgBuffer = Buffer.from(await imgRes.arrayBuffer());
+           const fallbackImage = sharp(imgBuffer);
+           
+           const optimizedBuffer = await fallbackImage
+              .resize({ width: 1024, height: 1024, fit: 'inside', withoutEnlargement: true })
+              .toFormat('jpeg', { quality: 80 })
+              .toBuffer();
+              
+           imageBase64 = optimizedBuffer.toString('base64');
+           console.log('[Design Parser] Fallback optimization successful');
+         } catch (fallbackError) {
+            console.error('[Design Parser] Fallback failed, using raw URL:', fallbackError);
+            // imageBase64 remains undefined, LLM will use imageUrl as last resort
+         }
+      }
     }
 
     return {

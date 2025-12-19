@@ -37,7 +37,7 @@ export class GeminiProvider implements LLMProvider {
                 { text: prompt },
                 {
                   inlineData: {
-                    mimeType: 'image/png',
+                    mimeType: 'image/jpeg',
                     data: base64Image,
                   },
                 },
@@ -51,7 +51,7 @@ export class GeminiProvider implements LLMProvider {
   
           const response = result.response;
           console.log('[Gemini] base64Image Response', response.text());
-          console.log('[Gemini] Image', base64Image);
+          // console.log('[Gemini] Image', base64Image);
           return response.text();
         }
       } 
